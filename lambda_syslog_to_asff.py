@@ -413,8 +413,18 @@ def _get(parsed: dict, *keys: str, default: str = "") -> str:
 def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: str) -> dict:
     """Convert parsed FortiGate dict → ASFF finding dict (validated)."""
 
-    # DEBUG: log all parsed field names so user can verify
-    logger.info("Parsed fields: %s", sorted(k for k in parsed if not k.startswith("_")))
+    # ── DIAGNOSTIC LOGGING ────────────────────────────────────────────────────
+    # Log the raw syslog line (first 500 chars)
+    raw_line = str(parsed.get("_raw", ""))
+    logger.info("RAW SYSLOG (first 500): %.500s", raw_line)
+
+    # Log ALL parsed field names + value snippets (first 80 chars each)
+    field_dump = {
+        k: str(v)[:80]
+        for k, v in parsed.items()
+        if not k.startswith("_")
+    }
+    logger.info("PARSED FIELDS: %s", json.dumps(field_dump, default=str))
 
     event_time: datetime = parsed["_event_time"]
     iso_time = event_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -424,7 +434,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         _get(parsed, "event_severity", "severity", "level") or None
     )
 
-    # ── Title / Description — try all common field name variants ─────────────
+    # ── Title — try all common fields, ultimate fallback = raw syslog line ───
     title = _get(
         parsed,
         "event_name",    # FortiAnalyzer
@@ -432,17 +442,27 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "msg",           # Raw FortiGate
         "logdesc",       # Raw FortiGate
         "reason",        # Raw FortiGate
-        default="Unknown Security Event",
-    )[:256]
+    )
+    if not title:
+        # Ultimate fallback: use the raw syslog line itself (first 256 chars)
+        title = f"FortiGate: {raw_line[:240]}" if raw_line else "FortiGate Security Event"
+    title = title[:256]
 
+    # ── Description — try all common fields, fallback = raw syslog line ──────
     description = _get(
         parsed,
         "event_message", # FortiAnalyzer
         "msg",           # Raw FortiGate
         "logdesc",       # Raw FortiGate
         "event_name",    # FortiAnalyzer fallback
-        default="No description available",
-    )[:1024]
+    )
+    if not description:
+        description = raw_line[:1024] if raw_line else "No description available"
+    description = description[:1024]
+
+    # Log final title and description
+    logger.info("TITLE: %s", title)
+    logger.info("DESCRIPTION (first 200): %.200s", description)
 
     # ── Resources — try all device name / type field variants ────────────────
     src_name = _sanitize_resource_id(
