@@ -467,7 +467,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "Severity": {
             "Label":      sev_label,
             "Normalized": sev_norm,
-            "Original":   str(parsed.get("event_severity", "information")),
+            "Original":   str(parsed.get("event_severity") or "information"),
         },
         "Title":       title,
         "Description": description,
@@ -488,7 +488,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "FindingProviderFields": {
             "Severity": {
                 "Label":    sev_label,
-                "Original": str(parsed.get("event_severity", "")),
+                "Original": str(parsed.get("event_severity") or "information"),
             },
             "Types": _map_type(parsed),
         },
