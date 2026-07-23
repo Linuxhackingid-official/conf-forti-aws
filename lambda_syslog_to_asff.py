@@ -50,7 +50,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 REGION             = os.environ.get("SECURITY_HUB_REGION",
-                     os.environ.get("AWS_DEFAULT_REGION", "ap-southest-3"))
+                     os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 PRODUCT_ARN_SUFFIX = os.environ.get("PRODUCT_ARN_SUFFIX", "default")
 BATCH_SIZE         = int(os.environ.get("FINDING_BATCH_SIZE", "100"))
 
@@ -363,6 +363,7 @@ def _finding_id(parsed: dict, account_id: str, region: str) -> str:
 
 # ── Fields already mapped (excluded from UserDefinedFields) ──────────────────
 _SKIP = frozenset({
+    # FortiAnalyzer normalized names
     "itime", "data_timestamp", "event_creation_time", "src_ip", "dst_ip",
     "event_severity", "event_message", "event_name", "event_type",
     "event_subtype", "event_action", "event_uuid", "event_id",
@@ -370,29 +371,77 @@ _SKIP = frozenset({
     "data_sourcetype", "data_sourcevdom", "host_owner", "event_status",
     "http_method", "net_sessionduration", "logon_ui", "event_ref",
     "data_parsername",
+    # Raw FortiGate field names
+    "msg", "devname", "devid", "type", "subtype", "action",
+    "srcip", "dstip", "srcname", "dstname", "user", "ui",
+    "severity", "level", "logid", "sessionid", "duration",
+    "proto", "service", "status", "reason", "logdesc",
+    # Internal parser fields
     "_raw", "_parsed_at", "_event_time",
     "_itime_dt", "_data_timestamp_dt", "_event_creation_time_dt",
 })
 
 
+def _get(parsed: dict, *keys: str, default: str = "") -> str:
+    """
+    Try multiple field name aliases in order; return first non-empty value.
+    Handles both FortiAnalyzer normalized names and raw FortiGate names.
+
+    Example:
+        _get(parsed, "event_message", "msg", "logdesc", default="No description")
+    """
+    for k in keys:
+        v = parsed.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return default
+
+
 def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: str) -> dict:
     """Convert parsed FortiGate dict → ASFF finding dict (validated)."""
+
+    # DEBUG: log all parsed field names so user can verify
+    logger.info("Parsed fields: %s", sorted(k for k in parsed if not k.startswith("_")))
 
     event_time: datetime = parsed["_event_time"]
     iso_time = event_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    sev_label, sev_norm = _map_severity(parsed.get("event_severity"))
-
-    title       = str(parsed.get("event_name") or
-                      parsed.get("event_message", "Unknown Security Event"))[:256]
-    description = str(parsed.get("event_message") or
-                      parsed.get("event_name", "No description available"))[:1024]
-
-    # ── Resources ─────────────────────────────────────────────────────────────
-    src_name = _sanitize_resource_id(
-        parsed.get("data_sourcename") or parsed.get("data_sourceid", "unknown-device")
+    # ── Severity — try FortiAnalyzer & raw FortiGate field names ─────────────
+    sev_label, sev_norm = _map_severity(
+        _get(parsed, "event_severity", "severity", "level") or None
     )
-    src_type = parsed.get("data_sourcetype", "Other")
+
+    # ── Title / Description — try all common field name variants ─────────────
+    title = _get(
+        parsed,
+        "event_name",    # FortiAnalyzer
+        "event_message", # FortiAnalyzer
+        "msg",           # Raw FortiGate
+        "logdesc",       # Raw FortiGate
+        "reason",        # Raw FortiGate
+        default="Unknown Security Event",
+    )[:256]
+
+    description = _get(
+        parsed,
+        "event_message", # FortiAnalyzer
+        "msg",           # Raw FortiGate
+        "logdesc",       # Raw FortiGate
+        "event_name",    # FortiAnalyzer fallback
+        default="No description available",
+    )[:1024]
+
+    # ── Resources — try all device name / type field variants ────────────────
+    src_name = _sanitize_resource_id(
+        _get(parsed,
+             "data_sourcename",  # FortiAnalyzer
+             "data_sourceid",    # FortiAnalyzer
+             "devname",          # Raw FortiGate
+             "devid",            # Raw FortiGate
+             "srcname",          # Raw FortiGate
+             default="unknown-device")
+    )
+    src_type = _get(parsed, "data_sourcetype", default="FortiGate")
 
     resources = [
         {
@@ -409,35 +458,41 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         }
     ]
 
-    user_name = parsed.get("user_name") or parsed.get("user_id")
+    user_name = _get(parsed,
+                     "user_name",  # FortiAnalyzer
+                     "user_id",    # FortiAnalyzer
+                     "user",       # Raw FortiGate
+                     "unauthuser", # Raw FortiGate
+                     default="")
     if user_name:
         resources.append({
             "Type":      "AwsIamUser",
-            "Id":        f"arn:aws:iam::{account_id}:user/{_sanitize_resource_id(str(user_name))}",
+            "Id":        f"arn:aws:iam::{account_id}:user/{_sanitize_resource_id(user_name)}",
             "Partition": "aws",
             "Tags": _sanitize_tags({
-                "Username": str(user_name),
-                "LoginUI":  str(parsed.get("logon_ui", "")),
+                "Username": user_name,
+                "LoginUI":  _get(parsed, "logon_ui", "ui"),
             }),
         })
 
-    # ── Network ───────────────────────────────────────────────────────────────
-    # FIX: Network.Protocol only accepts TCP / UDP / ICMP / ICMPv6
+    # ── Network — try FortiAnalyzer & raw FortiGate field names ─────────────
+    # NOTE: Network.Protocol only accepts TCP / UDP / ICMP / ICMPv6
     network: dict[str, Any] = {}
-    if parsed.get("src_ip"):
-        network["SourceIpV4"] = parsed["src_ip"]
-    if parsed.get("dst_ip"):
-        network["DestinationIpV4"] = parsed["dst_ip"]
+    src_ip = _get(parsed, "src_ip", "srcip")
+    dst_ip = _get(parsed, "dst_ip", "dstip")
+    if src_ip:
+        network["SourceIpV4"] = src_ip
+    if dst_ip:
+        network["DestinationIpV4"] = dst_ip
 
-    raw_proto = parsed.get("http_method") or parsed.get("event_ref")
+    raw_proto = _get(parsed, "http_method", "proto", "service", "event_ref")
     if raw_proto:
-        valid_proto = _sanitize_protocol(str(raw_proto))
+        valid_proto = _sanitize_protocol(raw_proto)
         if valid_proto:
             network["Protocol"] = valid_proto
-        # else: omit Network.Protocol entirely (invalid value = reject)
 
     # ── Compliance / Workflow ─────────────────────────────────────────────────
-    status = str(parsed.get("event_status", "")).lower()
+    status = _get(parsed, "event_status", "status", "reason").lower()
     compliance_status = {"success": "PASSED", "failed": "FAILED", "error": "FAILED"}.get(status)
     workflow_status   = "RESOLVED" if status == "success" else "NEW"
 
@@ -451,7 +506,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
 
     # ── GeneratorId (sanitized) ───────────────────────────────────────────────
     generator_id = _sanitize_generator_id(
-        f"{src_type}/{parsed.get('data_parsername', 'SyslogParser')}"
+        f"{src_type}/{_get(parsed, 'data_parsername', default='SyslogParser')}"
     )
 
     # ── Core ASFF finding ─────────────────────────────────────────────────────
@@ -475,15 +530,15 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "Workflow":    {"Status": workflow_status},
         "RecordState": "ACTIVE",
         "ProductFields": _sanitize_product_fields({
-            "ProviderName":    str(parsed.get("data_parsername", "FortiGate Log Parser")),
-            "SourceId":        str(parsed.get("data_sourceid", "")),
-            "SourceName":      str(parsed.get("data_sourcename", "")),
-            "SourceType":      str(src_type),
-            "EventType":       str(parsed.get("event_type", "")),
-            "EventSubtype":    str(parsed.get("event_subtype", "")),
-            "EventAction":     str(parsed.get("event_action", "")),
-            "EventStatus":     str(parsed.get("event_status", "")),
-            "SessionDuration": str(parsed.get("net_sessionduration", "")),
+            "ProviderName":    _get(parsed, "data_parsername",    default="FortiGate Log Parser"),
+            "SourceId":        _get(parsed, "data_sourceid",      "devid"),
+            "SourceName":      _get(parsed, "data_sourcename",    "devname"),
+            "SourceType":      src_type,
+            "EventType":       _get(parsed, "event_type",         "type"),
+            "EventSubtype":    _get(parsed, "event_subtype",      "subtype"),
+            "EventAction":     _get(parsed, "event_action",       "action"),
+            "EventStatus":     _get(parsed, "event_status",       "status"),
+            "SessionDuration": _get(parsed, "net_sessionduration", "duration"),
         }),
         "FindingProviderFields": {
             "Severity": {
@@ -503,10 +558,12 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
 
     # Note: session info
     notes = []
-    if parsed.get("net_sessionduration"):
-        notes.append(f"Session: {parsed['net_sessionduration']}s")
-    if parsed.get("logon_ui"):
-        notes.append(f"UI: {str(parsed['logon_ui'])[:200]}")
+    dur = _get(parsed, "net_sessionduration", "duration")
+    if dur:
+        notes.append(f"Session: {dur}s")
+    login_ui = _get(parsed, "logon_ui", "ui")
+    if login_ui:
+        notes.append(f"UI: {login_ui[:200]}")
     if notes:
         finding["Note"] = {
             "Text":      " | ".join(notes)[:512],
