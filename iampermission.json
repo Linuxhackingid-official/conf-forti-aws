@@ -1,0 +1,8 @@
+{
+  "Action": [
+    "securityhub:BatchImportFindings",
+    "sts:GetCallerIdentity"
+  ],
+  "Effect": "Allow",
+  "Resource": "*"
+}
