@@ -50,7 +50,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 REGION             = os.environ.get("SECURITY_HUB_REGION",
-                     os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-3"))
+                     os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 PRODUCT_ARN_SUFFIX = os.environ.get("PRODUCT_ARN_SUFFIX", "default")
 BATCH_SIZE         = int(os.environ.get("FINDING_BATCH_SIZE", "100"))
 
@@ -298,25 +298,12 @@ def _sanitize_tags(raw_dict: dict[str, str]) -> dict[str, str]:
 
 # ── Severity ──────────────────────────────────────────────────────────────────
 _SEVERITY_MAP: dict[str, tuple[str, int]] = {
-    "emergency":    ("CRITICAL",      100),
-    "alert":        ("CRITICAL",       90),
-    "critical":     ("CRITICAL",       90),
-    "error":        ("HIGH",           70),
-    "warning":      ("MEDIUM",         50),
-    "notification": ("LOW",            30),
-    "information":  ("INFORMATIONAL",  10),
-    "debug":        ("INFORMATIONAL",   0),
-    # RFC-5424 numeric
-    "0": ("CRITICAL",      100),
-    "1": ("CRITICAL",       90),
-    "2": ("CRITICAL",       90),
-    "3": ("HIGH",           70),
-    "4": ("MEDIUM",         50),
-    "5": ("LOW",            30),
-    "6": ("INFORMATIONAL",  10),
-    "7": ("INFORMATIONAL",   0),
+    # Based on FortiGate Event Type (type / event_type)
+    "utm":          ("HIGH",           70),
+    "anomaly":      ("MEDIUM",         50),
+    "event":        ("INFORMATIONAL",  10),
+    "traffic":      ("INFORMATIONAL",   0),
 }
-
 
 def _map_severity(raw: Optional[str]) -> tuple[str, int]:
     if raw is None:
@@ -353,25 +340,10 @@ def _map_type(parsed: dict) -> list[str]:
     return [_DEFAULT_TYPE]
 
 
-# ── Finding ID (deterministic / idempotent) ───────────────────────────────────
+# ── Finding ID (randomized per event) ─────────────────────────────────────────
 def _finding_id(parsed: dict, account_id: str, region: str) -> str:
-    event_uuid = parsed.get("event_uuid", "")
-    if event_uuid:
-        try:
-            uid = str(uuid.UUID(str(event_uuid)))
-        except ValueError:
-            # Not a UUID format — use as-is but sanitize
-            uid = re.sub(r"[^A-Za-z0-9\-]", "-", str(event_uuid))[:64]
-        return f"arn:aws:securityhub:{region}:{account_id}:finding/{uid}"
-
-    seed = "|".join([
-        str(parsed.get("event_id", "")),
-        str(parsed.get("data_sourceid", "")),
-        str(parsed.get("event_creation_time", parsed.get("itime", ""))),
-        str(parsed.get("event_message", "")),
-    ])
-    h = hashlib.sha256(seed.encode()).hexdigest()
-    return f"arn:aws:securityhub:{region}:{account_id}:finding/{h}"
+    uid = str(uuid.uuid4())
+    return f"arn:aws:securityhub:{region}:{account_id}:finding/{uid}"
 
 
 # ── Fields already mapped (excluded from UserDefinedFields) ──────────────────
@@ -429,10 +401,9 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
     event_time: datetime = parsed["_event_time"]
     iso_time = event_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    # ── Severity — try FortiAnalyzer & raw FortiGate field names ─────────────
-    sev_label, sev_norm = _map_severity(
-        _get(parsed, "event_severity", "severity", "level") or None
-    )
+    # ── Severity — use EventType (type / event_type) ──────────────────────────
+    event_type_val = _get(parsed, "event_type", "type")
+    sev_label, sev_norm = _map_severity(event_type_val or None)
 
     # ── Title — try all common fields, ultimate fallback = raw syslog line ───
     title = _get(
