@@ -50,7 +50,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 REGION             = os.environ.get("SECURITY_HUB_REGION",
-                     os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-3"))
+                     os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 PRODUCT_ARN_SUFFIX = os.environ.get("PRODUCT_ARN_SUFFIX", "default")
 BATCH_SIZE         = int(os.environ.get("FINDING_BATCH_SIZE", "100"))
 
@@ -298,11 +298,23 @@ def _sanitize_tags(raw_dict: dict[str, str]) -> dict[str, str]:
 
 # ── Severity ──────────────────────────────────────────────────────────────────
 _SEVERITY_MAP: dict[str, tuple[str, int]] = {
-    # Based on FortiGate Event Type (type / event_type)
-    "utm":          ("HIGH",           70),
-    "anomaly":      ("MEDIUM",         50),
-    "event":        ("INFORMATIONAL",  10),
-    "traffic":      ("INFORMATIONAL",   0),
+    "emergency":    ("CRITICAL",      100),
+    "alert":        ("CRITICAL",       90),
+    "critical":     ("CRITICAL",       90),
+    "error":        ("HIGH",           70),
+    "warning":      ("MEDIUM",         50),
+    "notification": ("LOW",            30),
+    "information":  ("INFORMATIONAL",  10),
+    "debug":        ("INFORMATIONAL",   0),
+    # RFC-5424 numeric
+    "0": ("CRITICAL",      100),
+    "1": ("CRITICAL",       90),
+    "2": ("CRITICAL",       90),
+    "3": ("HIGH",           70),
+    "4": ("MEDIUM",         50),
+    "5": ("LOW",            30),
+    "6": ("INFORMATIONAL",  10),
+    "7": ("INFORMATIONAL",   0),
 }
 
 def _map_severity(raw: Optional[str]) -> tuple[str, int]:
@@ -401,9 +413,9 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
     event_time: datetime = parsed["_event_time"]
     iso_time = event_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    # ── Severity — use EventType (type / event_type) ──────────────────────────
-    event_type_val = _get(parsed, "event_type", "type")
-    sev_label, sev_norm = _map_severity(event_type_val or None)
+    # ── Severity — use level (level / event_severity / severity) ──────────────
+    level_val = _get(parsed, "level", "event_severity", "severity")
+    sev_label, sev_norm = _map_severity(level_val or None)
 
     # ── Title — try all common fields, ultimate fallback = raw syslog line ───
     title = _get(
@@ -526,7 +538,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "Severity": {
             "Label":      sev_label,
             "Normalized": sev_norm,
-            "Original":   str(parsed.get("event_severity") or "information"),
+            "Original":   str(level_val or "information"),
         },
         "Title":       title,
         "Description": description,
@@ -547,7 +559,7 @@ def build_asff_finding(parsed: dict, account_id: str, product_arn: str, region: 
         "FindingProviderFields": {
             "Severity": {
                 "Label":    sev_label,
-                "Original": str(parsed.get("event_severity") or "information"),
+                "Original": str(level_val or "information"),
             },
             "Types": _map_type(parsed),
         },
