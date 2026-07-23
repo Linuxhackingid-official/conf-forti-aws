@@ -64,22 +64,13 @@ sts_client  = boto3.client("sts")
 # SECTION 1 — SYSLOG PARSER
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Matches:  key="quoted value"   or   key=unquoted_value
-_TOKEN_RE = re.compile(
-    r"""
-    (?P<key>[A-Za-z_][A-Za-z0-9_.]*?)   # field name
-    =                                     # separator
-    (?:
-        "(?P<qval>(?:[^"\\]|\\.)*)"       # double-quoted value
-      |
-        (?P<uval>[^\s"=]*)                # unquoted value (no spaces)
-    )
-    """,
-    re.VERBOSE,
-)
+# Finds every  key=  that starts at beginning-of-string or after whitespace.
+# This ensures we don't match  key=  patterns that are INSIDE values
+# (e.g. inside a JSON string or a URL like https://x.com?q=1).
+_KEY_POS_RE = re.compile(r'(?:(?<=\s)|^)([A-Za-z_][A-Za-z0-9_.]*?)=')
 
 _DT_FORMATS = [
-    "%Y-%m-%d %H:%M:%S",   # itime=2026-07-23 20:47:53
+    "%Y-%m-%d %H:%M:%S",   # itime=2026-07-23 22:22:03
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%dT%H:%M:%SZ",
 ]
@@ -107,13 +98,32 @@ def _try_parse_json(s: str) -> Any:
 
 def parse_syslog_line(line: str) -> Optional[dict]:
     """
-    Parse a FortiGate syslog key=value line into a Python dict.
+    Parse a FortiGate syslog key=value line into a structured dict.
 
-    Special handling:
-      - itime=2026-07-23 20:47:53   (date+time split across two tokens)
-      - net_wlan={\"sn\":\"123\"}   (backslash-escaped embedded JSON)
-      - Quoted strings with spaces
-    Returns None if line is empty or has no parseable fields.
+    Strategy: locate ALL  key=  positions first, then slice the raw line
+    between consecutive key positions.  This correctly handles:
+
+      - Multi-word unquoted values:
+          event_name=Admin logout successful logon_ui=...
+          → event_name = "Admin logout successful"   ✅
+
+      - Values containing spaces (device names, messages):
+          data_sourcename=FGT-AWS root data_sourcetype=...
+          → data_sourcename = "FGT-AWS root"          ✅
+
+      - Date+time values:
+          itime=2026-07-23 22:22:03 epid=...
+          → itime = "2026-07-23 22:22:03"             ✅
+
+      - Quoted values (standard):
+          event_message="Admin logout successful(...)"
+          → event_message = "Admin logout successful(...)" ✅
+
+      - Embedded JSON (backslash-escaped by FortiGate):
+          net_wlan={\"sn\":\"1784819455\"}
+          → net_wlan = {"sn": "1784819455"}           ✅
+
+    Returns None if line is blank or has no parseable fields.
     """
     if not line or not line.strip():
         return None
@@ -123,43 +133,46 @@ def parse_syslog_line(line: str) -> Optional[dict]:
         "_parsed_at": datetime.now(tz=timezone.utc),
     }
 
-    # ── Tokenise ──────────────────────────────────────────────────────────────
-    pairs: list[tuple[str, str, int, int]] = []
-    for m in _TOKEN_RE.finditer(line):
-        key = m.group("key")
-        val = m.group("qval") if m.group("qval") is not None else m.group("uval")
-        pairs.append((key, val, m.start(), m.end()))
-
-    if not pairs:
+    # ── Find all key= positions ────────────────────────────────────────────────
+    key_matches = list(_KEY_POS_RE.finditer(line))
+    if not key_matches:
         logger.debug("No key=value pairs found: %.120s", line)
         return None
 
-    # ── Stitch itime date + time (two tokens) ─────────────────────────────────
-    cleaned: list[tuple[str, str]] = []
-    skip_next = False
-    for idx, (key, val, _s, _e) in enumerate(pairs):
-        if skip_next:
-            skip_next = False
-            continue
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", val) and idx + 1 < len(pairs):
-            nk, nv, _, _ = pairs[idx + 1]
-            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", nk) and nv == "":
-                val = f"{val} {nk}"
-                skip_next = True
-            elif re.fullmatch(r"\d{2}:\d{2}:\d{2}", nv):
-                val = f"{val} {nv}"
-                skip_next = True
-        cleaned.append((key, val))
+    # ── Slice values between consecutive key positions ─────────────────────────
+    for i, m in enumerate(key_matches):
+        key       = m.group(1)
+        val_start = m.end()                       # character right after '='
+        val_end   = key_matches[i + 1].start() if i + 1 < len(key_matches) else len(line)
 
-    # ── Build dict ────────────────────────────────────────────────────────────
-    for key, val in cleaned:
-        unescaped = val.replace('\\"', '"').replace("\\'", "'")
-        if unescaped.startswith(("{", "[")):
-            result[key] = _try_parse_json(unescaped)
-        else:
-            result[key] = unescaped
+        raw_val = line[val_start:val_end].strip()
 
-    # ── Parse timestamps ──────────────────────────────────────────────────────
+        # ── Handle quoted value ───────────────────────────────────────────────
+        if raw_val.startswith('"'):
+            inner = raw_val[1:]
+            # Find the closing un-escaped quote
+            end_q = -1
+            j = 0
+            while j < len(inner):
+                if inner[j] == '\\':
+                    j += 2          # skip escaped char
+                    continue
+                if inner[j] == '"':
+                    end_q = j
+                    break
+                j += 1
+            raw_val = inner[:end_q] if end_q >= 0 else inner
+            # Unescape \" inside
+            raw_val = raw_val.replace('\\"', '"').replace("\\'", "'")
+
+        # ── Handle embedded JSON (FortiGate backslash-escapes JSON values) ────
+        elif raw_val.startswith(("{", "[")):
+            unescaped = raw_val.replace('\\"', '"')
+            raw_val = _try_parse_json(unescaped)
+
+        result[key] = raw_val
+
+    # ── Parse timestamps ───────────────────────────────────────────────────────
     for ts_key in ("itime", "data_timestamp", "event_creation_time"):
         raw_ts = result.get(ts_key)
         if raw_ts:
@@ -167,7 +180,7 @@ def parse_syslog_line(line: str) -> Optional[dict]:
             if dt:
                 result[f"_{ts_key}_dt"] = dt
 
-    # Primary event time (most precise wins)
+    # Primary event time — most precise field wins
     result["_event_time"] = (
         result.get("_event_creation_time_dt")
         or result.get("_data_timestamp_dt")
