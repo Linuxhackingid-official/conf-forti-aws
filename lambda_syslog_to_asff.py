@@ -50,7 +50,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 REGION             = os.environ.get("SECURITY_HUB_REGION",
-                     os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+                     os.environ.get("AWS_DEFAULT_REGION", "ap-southest-3"))
 PRODUCT_ARN_SUFFIX = os.environ.get("PRODUCT_ARN_SUFFIX", "default")
 BATCH_SIZE         = int(os.environ.get("FINDING_BATCH_SIZE", "100"))
 
